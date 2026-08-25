@@ -16,6 +16,10 @@ const io = new Server(server, {
     methods: ['GET'],
   },
   transports: ['websocket', 'polling'],
+  // Compress larger state updates while avoiding compression overhead for small events.
+  perMessageDeflate: { threshold: 1024 },
+  // Reduce keepalive traffic for long-lived, mostly idle websocket connections.
+  pingInterval: 60_000,
 })
 
 io.on('connection', (socket) => {
@@ -33,6 +37,15 @@ const namespaces = [
 ]
 
 const namespaceRoomStores: { [k: string]: any } = {}
+const lastSentRoomStates: { [k: string]: string } = {}
+
+function getRoomStateKey(namespace: string, room: string) {
+  return `${namespace}/${room}`
+}
+
+function serializeRoomState(namespace: string, room: string) {
+  return JSON.stringify(namespaceRoomStores[getRoomStateKey(namespace, room)], replacer)
+}
 
 function createNamespacedLogger(ns: string, color: Chalk) {
   const cleanNs = ns.slice(1)
@@ -69,6 +82,14 @@ for (const ns of namespaces) {
     if (channelRoom) {
       socket.join(`${channelRoom}`)
     }
+
+    // New clients need a complete snapshot, but existing clients should not receive
+    // the same state again merely because another client connected.
+    if (ns.sendUpdates) {
+      const state = serializeRoomState(nsName, channelRoom)
+      lastSentRoomStates[getRoomStateKey(nsName, channelRoom)] = state
+      socket.emit('event', { type: 'update', data: state })
+    }
     socket.on('event', async (msg: { type?: string }) => {
       let msgObject = msg
       if (typeof msg === 'string') {
@@ -97,12 +118,17 @@ for (const ns of namespaces) {
       const sockets = [...io.of(ns.name).adapter.sids.keys()]
       const nonSocketRooms = rooms.filter((id) => !sockets.includes(id))
       for (const room of nonSocketRooms) {
-        io.of(ns.name)
-          .to(room)
-          .emit('event', {
-            type: 'update',
-            data: JSON.stringify(namespaceRoomStores[`${ns.name}/${room}`], replacer),
-          })
+        const roomStateKey = getRoomStateKey(ns.name, room)
+        const state = serializeRoomState(ns.name, room)
+
+        // State is retained between updates. Do not retransmit an identical full
+        // snapshot on every interval.
+        if (lastSentRoomStates[roomStateKey] === state) {
+          continue
+        }
+
+        lastSentRoomStates[roomStateKey] = state
+        io.of(ns.name).to(room).emit('event', { type: 'update', data: state })
       }
     }, ns.updateTime)
   }
